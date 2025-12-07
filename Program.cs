@@ -2,7 +2,8 @@ using FairOddsConsole.Domain.Models;
 using FairOddsConsole.Infrastructure;
 using FairOddsConsole.Services;
 
-var apiKey = Environment.GetEnvironmentVariable("API_FOOTBALL_KEY");
+//var apiKey = "9d4f4fbbe8b174c928ba25a54e476137";
+var apiKey = "995a0d2b8fd2234076e2586965349a64";
 if (string.IsNullOrWhiteSpace(apiKey))
 {
     Console.WriteLine("API_FOOTBALL_KEY environment variable not set. Please provide your API-Football key.");
@@ -65,43 +66,21 @@ foreach (var fixture in fixtures)
         continue;
     }
 
-    var (probabilities, recommendations) = recommendationService.Evaluate(fixture, odds);
+    var (_, recommendations) = recommendationService.Evaluate(fixture, odds);
 
     Console.WriteLine($"{fixture.League} | {fixture.HomeTeam} vs {fixture.AwayTeam} | Kickoff: {fixture.Kickoff:u}");
-    Console.WriteLine($"API Odds: H {odds.HomeWin:F2}  D {odds.Draw:F2}  A {odds.AwayWin:F2} | U2.5 {odds.Under2_5:F2} O2.5 {odds.Over2_5:F2} | BTTS {odds.BTTS_Yes:F2} / {odds.BTTS_No:F2}");
-    Console.WriteLine("Model:");
-
-    void PrintMarket(string label, double apiOdds, double modelProb)
-    {
-        if (apiOdds <= 0 || modelProb <= 0)
-        {
-            Console.WriteLine($"  {label}: missing odds/model probability");
-            return;
-        }
-
-        var edge = fairOddsService.Calculate(label, apiOdds, modelProb);
-        Console.WriteLine($"  P({label}) = {modelProb:F2} → Fair {edge.FairOdds:F2} → Edge {edge.Edge:+0.00;-0.00}");
-    }
-
-    PrintMarket("Home", odds.HomeWin, probabilities.HomeWin);
-    PrintMarket("Draw", odds.Draw, probabilities.Draw);
-    PrintMarket("Away", odds.AwayWin, probabilities.AwayWin);
-    PrintMarket("Under2.5", odds.Under2_5, probabilities.Under2_5);
-    PrintMarket("Over2.5", odds.Over2_5, probabilities.Over2_5);
-    PrintMarket("BTTS Yes", odds.BTTS_Yes, probabilities.BTTS_Yes);
-    PrintMarket("BTTS No", odds.BTTS_No, probabilities.BTTS_No);
 
     var recommendedList = recommendations.ToList();
     if (recommendedList.Count == 0)
     {
-        Console.WriteLine("No positive expected value markets found.\n");
+        Console.WriteLine("  No favorable markets (edge > 2%).\n");
         continue;
     }
 
-    Console.WriteLine("Recommended Bets (Edge > 0.02):");
+    Console.WriteLine("  Favorable markets (edge > 2%):");
     foreach (var rec in recommendedList)
     {
-        Console.WriteLine($"  {rec.Market}: API {rec.ApiOdds:F2} | Model P {rec.ModelProbability:F2} | Fair {rec.FairOdds:F2} | Edge {rec.Edge:+0.00;-0.00}");
+        Console.WriteLine($"    {rec.Market,-12} Edge {rec.Edge:+0.00;-0.00} | API {rec.ApiOdds:F2} | Fair {rec.FairOdds:F2} | Model P {rec.ModelProbability:F2}");
     }
 
     Console.WriteLine();

@@ -5,7 +5,8 @@ namespace FairOddsConsole.Services;
 public class MarketProbabilityService
 {
     private readonly PoissonEngine _poisson;
-    private const int MaxGoals = 10;
+    // Limit goal simulation per specification; tail mass >6 is ignored.
+    private const int MaxGoals = 6;
 
     public MarketProbabilityService(PoissonEngine poisson)
     {

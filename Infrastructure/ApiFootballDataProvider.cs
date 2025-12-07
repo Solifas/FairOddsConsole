@@ -1,6 +1,5 @@
-using System.Net.Http.Json;
+using System.Globalization;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using FairOddsConsole.Domain.Models;
 using FairOddsConsole.Services;
 
@@ -8,11 +7,29 @@ namespace FairOddsConsole.Infrastructure;
 
 public class ApiFootballDataProvider : IFootballDataProvider
 {
-    private const string FixturesEndpoint = "https://v3.football.api-sports.io/fixtures";
-    private const string OddsEndpoint = "https://v3.football.api-sports.io/odds";
+    private const string BaseUrl = "https://api.the-odds-api.com/v4";
+    private static readonly string[] SoccerSportKeys = new[]
+    {
+        "soccer_epl",
+        "soccer_spain_la_liga",
+        "soccer_germany_bundesliga",
+        "soccer_italy_serie_a",
+        "soccer_france_ligue_one",
+        "soccer_netherlands_eredivisie",
+        "soccer_portugal_primeira_liga",
+        "soccer_belgium_first_div",
+        "soccer_brazil_campeonato",
+        "soccer_argentina_primera_division",
+        "soccer_usa_mls"
+    };
+    // Odds API v4 supports markets like h2h, spreads, totals, outrights. BTTS is not available, so we
+    // derive only the markets present and leave BTTS at 0 when absent.
+    private const string MarketsRequested = "h2h,totals";
+    private const string RegionsRequested = "eu";
 
     private readonly HttpClient _client;
     private readonly string _apiKey;
+    private readonly Dictionary<string, Odds> _oddsCache = new();
 
     public ApiFootballDataProvider(HttpClient client, string apiKey)
     {
@@ -22,222 +39,233 @@ public class ApiFootballDataProvider : IFootballDataProvider
 
     public async Task<List<Fixture>> GetFixturesAsync(DateTime from, DateTime to)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"{FixturesEndpoint}?from={from:yyyy-MM-dd}&to={to:yyyy-MM-dd}");
-        request.Headers.Add("x-apisports-key", _apiKey);
+        _oddsCache.Clear();
 
-        using var response = await _client.SendAsync(request);
-        response.EnsureSuccessStatusCode();
+        // Lock to the next 24 hours from "now" per request.
+        var windowStart = DateTime.UtcNow;
+        var windowEnd = windowStart.AddHours(24);
 
-        var json = await response.Content.ReadAsStringAsync();
-        var payload = JsonSerializer.Deserialize<ApiResponse<List<FixtureResponse>>>(json, JsonOptions());
+        var fixtures = new Dictionary<string, Fixture>(StringComparer.OrdinalIgnoreCase);
 
-        var fixtures = new List<Fixture>();
-        if (payload?.Response is null)
+        foreach (var sportKey in SoccerSportKeys)
         {
-            return fixtures;
-        }
-
-        foreach (var fx in payload.Response)
-        {
-            fixtures.Add(new Fixture
+            var url = BuildOddsUrl(sportKey);
+            using var response = await _client.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
             {
-                Id = fx.Fixture.Id,
-                League = fx.League.Name ?? fx.League.Country ?? string.Empty,
-                HomeTeam = fx.Teams.Home.Name ?? string.Empty,
-                AwayTeam = fx.Teams.Away.Name ?? string.Empty,
-                Kickoff = fx.Fixture.Date
-            });
+                var body = await response.Content.ReadAsStringAsync();
+                throw new HttpRequestException($"Odds API request failed for {sportKey}: {(int)response.StatusCode} {response.ReasonPhrase}. Body: {body}");
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(json);
+
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+
+            foreach (var ev in doc.RootElement.EnumerateArray())
+            {
+                var fixture = MapFixture(ev);
+                if (fixture is null)
+                {
+                    continue;
+                }
+
+                if (fixture.Kickoff < windowStart || fixture.Kickoff > windowEnd)
+                {
+                    continue;
+                }
+
+                fixtures.TryAdd(fixture.Id, fixture);
+
+                var markets = ExtractMarkets(ev, fixture.HomeTeam, fixture.AwayTeam);
+                if (markets.HasAny)
+                {
+                    _oddsCache[fixture.Id] = new Odds
+                    {
+                        HomeWin = markets.Home,
+                        Draw = markets.Draw,
+                        AwayWin = markets.Away,
+                        Under2_5 = markets.Under2_5,
+                        Over2_5 = markets.Over2_5,
+                        BTTS_Yes = markets.BttsYes,
+                        BTTS_No = markets.BttsNo
+                    };
+                }
+            }
         }
 
-        return fixtures;
+        return fixtures.Values.ToList();
     }
 
-    public async Task<Odds?> GetOddsAsync(Fixture fx)
+    public Task<Odds?> GetOddsAsync(Fixture fx)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"{OddsEndpoint}?fixture={fx.Id}");
-        request.Headers.Add("x-apisports-key", _apiKey);
+        if (_oddsCache.TryGetValue(fx.Id, out var odds))
+        {
+            return Task.FromResult<Odds?>(odds);
+        }
 
-        using var response = await _client.SendAsync(request);
-        response.EnsureSuccessStatusCode();
+        return Task.FromResult<Odds?>(null);
+    }
 
-        var json = await response.Content.ReadAsStringAsync();
-        var payload = JsonSerializer.Deserialize<ApiResponse<List<OddsResponse>>>(json, JsonOptions());
-        var oddsResponse = payload?.Response?.FirstOrDefault();
+    private string BuildOddsUrl(string sportKey)
+    {
+        var apiKeyParam = Uri.EscapeDataString(_apiKey);
 
-        if (oddsResponse is null)
+        // v4 odds endpoint does not accept commence time filters; request upcoming and filter client-side.
+        return $"{BaseUrl}/sports/{Uri.EscapeDataString(sportKey)}/odds?apiKey={apiKeyParam}&regions={RegionsRequested}&markets={MarketsRequested}&oddsFormat=decimal&dateFormat=iso";
+    }
+
+    private static Fixture? MapFixture(JsonElement ev)
+    {
+        if (!ev.TryGetProperty("id", out var idEl))
         {
             return null;
         }
 
-        var markets = ExtractMarkets(oddsResponse);
-        return new Odds
+        var id = idEl.GetString();
+        if (string.IsNullOrWhiteSpace(id))
         {
-            HomeWin = markets.MatchWinner.Home,
-            Draw = markets.MatchWinner.Draw,
-            AwayWin = markets.MatchWinner.Away,
-            Under2_5 = markets.UnderOver.Under2_5,
-            Over2_5 = markets.UnderOver.Over2_5,
-            BTTS_Yes = markets.Btts.Yes,
-            BTTS_No = markets.Btts.No
+            return null;
+        }
+
+        var home = ev.TryGetProperty("home_team", out var homeEl) ? homeEl.GetString() ?? string.Empty : string.Empty;
+        var away = ev.TryGetProperty("away_team", out var awayEl) ? awayEl.GetString() ?? string.Empty : string.Empty;
+        var league = ev.TryGetProperty("sport_title", out var leagueEl) ? leagueEl.GetString() ?? string.Empty : string.Empty;
+
+        if (!ev.TryGetProperty("commence_time", out var kickoffEl) ||
+            kickoffEl.ValueKind != JsonValueKind.String ||
+            !DateTime.TryParse(kickoffEl.GetString(), null, DateTimeStyles.AdjustToUniversal, out var kickoff))
+        {
+            return null;
+        }
+
+        return new Fixture
+        {
+            Id = id,
+            League = league,
+            HomeTeam = home,
+            AwayTeam = away,
+            Kickoff = kickoff
         };
     }
 
-    private static (MatchWinner MarketWinner, UnderOverMarket UnderOver, BttsMarket Btts) ExtractMarkets(OddsResponse oddsResponse)
+    private static Markets ExtractMarkets(JsonElement ev, string homeTeam, string awayTeam)
     {
-        var matchWinner = new MatchWinner();
-        var underOver = new UnderOverMarket();
-        var btts = new BttsMarket();
+        var markets = new Markets();
 
-        foreach (var bookmaker in oddsResponse.Bookmakers)
+        if (!ev.TryGetProperty("bookmakers", out var bookmakers) || bookmakers.ValueKind != JsonValueKind.Array)
         {
-            foreach (var bet in bookmaker.Bets)
+            return markets;
+        }
+
+        foreach (var bookmaker in bookmakers.EnumerateArray())
+        {
+            if (!bookmaker.TryGetProperty("markets", out var marketsEl) || marketsEl.ValueKind != JsonValueKind.Array)
             {
-                if (string.Equals(bet.Name, "Match Winner", StringComparison.OrdinalIgnoreCase))
+                continue;
+            }
+
+            foreach (var market in marketsEl.EnumerateArray())
+            {
+                var key = market.TryGetProperty("key", out var keyEl) ? keyEl.GetString() ?? string.Empty : string.Empty;
+                if (!market.TryGetProperty("outcomes", out var outcomesEl) || outcomesEl.ValueKind != JsonValueKind.Array)
                 {
-                    foreach (var value in bet.Values)
+                    continue;
+                }
+
+                if (key.Equals("h2h", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var outcome in outcomesEl.EnumerateArray())
                     {
-                        if (string.Equals(value.Value, "Home", StringComparison.OrdinalIgnoreCase))
-                            matchWinner.Home = ParseOdd(value.Odd);
-                        else if (string.Equals(value.Value, "Draw", StringComparison.OrdinalIgnoreCase))
-                            matchWinner.Draw = ParseOdd(value.Odd);
-                        else if (string.Equals(value.Value, "Away", StringComparison.OrdinalIgnoreCase))
-                            matchWinner.Away = ParseOdd(value.Odd);
+                        var name = outcome.TryGetProperty("name", out var nameEl) ? nameEl.GetString() ?? string.Empty : string.Empty;
+                        var price = ReadPrice(outcome);
+                        if (price <= 0)
+                        {
+                            continue;
+                        }
+
+                        if (name.Equals(homeTeam, StringComparison.OrdinalIgnoreCase))
+                            markets.Home = PreferFirst(markets.Home, price);
+                        else if (name.Equals(awayTeam, StringComparison.OrdinalIgnoreCase))
+                            markets.Away = PreferFirst(markets.Away, price);
+                        else if (IsDrawName(name))
+                            markets.Draw = PreferFirst(markets.Draw, price);
                     }
                 }
-                else if (bet.Name?.Contains("Over/Under", StringComparison.OrdinalIgnoreCase) == true)
+                else if (key.Equals("totals", StringComparison.OrdinalIgnoreCase))
                 {
-                    foreach (var value in bet.Values)
+                    foreach (var outcome in outcomesEl.EnumerateArray())
                     {
-                        if (string.Equals(value.Value, "Over 2.5", StringComparison.OrdinalIgnoreCase))
-                            underOver.Over2_5 = ParseOdd(value.Odd);
-                        else if (string.Equals(value.Value, "Under 2.5", StringComparison.OrdinalIgnoreCase))
-                            underOver.Under2_5 = ParseOdd(value.Odd);
-                    }
-                }
-                else if (bet.Name?.Contains("Both Teams To Score", StringComparison.OrdinalIgnoreCase) == true)
-                {
-                    foreach (var value in bet.Values)
-                    {
-                        if (string.Equals(value.Value, "Yes", StringComparison.OrdinalIgnoreCase))
-                            btts.Yes = ParseOdd(value.Odd);
-                        else if (string.Equals(value.Value, "No", StringComparison.OrdinalIgnoreCase))
-                            btts.No = ParseOdd(value.Odd);
+                        var price = ReadPrice(outcome);
+                        var point = ReadPoint(outcome);
+                        var name = outcome.TryGetProperty("name", out var nameEl) ? nameEl.GetString() ?? string.Empty : string.Empty;
+
+                        if (price <= 0 || !point.HasValue || Math.Abs(point.Value - 2.5) > 0.01)
+                        {
+                            continue;
+                        }
+
+                        if (name.Equals("Over", StringComparison.OrdinalIgnoreCase))
+                            markets.Over2_5 = PreferFirst(markets.Over2_5, price);
+                        else if (name.Equals("Under", StringComparison.OrdinalIgnoreCase))
+                            markets.Under2_5 = PreferFirst(markets.Under2_5, price);
                     }
                 }
             }
         }
 
-        return (matchWinner, underOver, btts);
+        return markets;
     }
 
-    private static double ParseOdd(string? odd)
+    private static double ReadPrice(JsonElement outcome)
     {
-        return double.TryParse(odd, out var value) ? value : 0;
+        if (!outcome.TryGetProperty("price", out var priceEl))
+        {
+            return 0;
+        }
+
+        return priceEl.ValueKind switch
+        {
+            JsonValueKind.Number => priceEl.TryGetDouble(out var dbl) ? dbl : 0,
+            JsonValueKind.String => double.TryParse(priceEl.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var dbl) ? dbl : 0,
+            _ => 0
+        };
     }
 
-    private static JsonSerializerOptions JsonOptions() => new()
+    private static double? ReadPoint(JsonElement outcome)
     {
-        PropertyNameCaseInsensitive = true,
-        Converters = { new JsonStringEnumConverter() }
-    };
+        if (!outcome.TryGetProperty("point", out var pointEl))
+        {
+            return null;
+        }
 
-    private class ApiResponse<T>
-    {
-        [JsonPropertyName("response")]
-        public T? Response { get; set; }
+        return pointEl.ValueKind switch
+        {
+            JsonValueKind.Number => pointEl.TryGetDouble(out var dbl) ? dbl : null,
+            JsonValueKind.String => double.TryParse(pointEl.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var dbl) ? dbl : null,
+            _ => null
+        };
     }
 
-    private class FixtureResponse
+    private static bool IsDrawName(string name) =>
+        name.Equals("Draw", StringComparison.OrdinalIgnoreCase) || name.Equals("Tie", StringComparison.OrdinalIgnoreCase) || name.Equals("X", StringComparison.OrdinalIgnoreCase);
+
+    private static double PreferFirst(double existing, double incoming) => existing > 0 ? existing : incoming;
+
+    private struct Markets
     {
-        [JsonPropertyName("fixture")]
-        public FixtureInfo Fixture { get; set; } = new();
+        public double Home;
+        public double Draw;
+        public double Away;
+        public double Under2_5;
+        public double Over2_5;
+        public double BttsYes;
+        public double BttsNo;
 
-        [JsonPropertyName("teams")]
-        public Teams Teams { get; set; } = new();
-
-        [JsonPropertyName("league")]
-        public League League { get; set; } = new();
-    }
-
-    private class FixtureInfo
-    {
-        [JsonPropertyName("id")]
-        public int Id { get; set; }
-
-        [JsonPropertyName("date")]
-        public DateTime Date { get; set; }
-    }
-
-    private class Teams
-    {
-        [JsonPropertyName("home")]
-        public Team Home { get; set; } = new();
-
-        [JsonPropertyName("away")]
-        public Team Away { get; set; } = new();
-    }
-
-    private class Team
-    {
-        [JsonPropertyName("name")]
-        public string? Name { get; set; }
-    }
-
-    private class League
-    {
-        [JsonPropertyName("name")]
-        public string? Name { get; set; }
-
-        [JsonPropertyName("country")]
-        public string? Country { get; set; }
-    }
-
-    private class OddsResponse
-    {
-        [JsonPropertyName("bookmakers")]
-        public List<Bookmaker> Bookmakers { get; set; } = new();
-    }
-
-    private class Bookmaker
-    {
-        [JsonPropertyName("bets")]
-        public List<Bet> Bets { get; set; } = new();
-    }
-
-    private class Bet
-    {
-        [JsonPropertyName("name")]
-        public string? Name { get; set; }
-
-        [JsonPropertyName("values")]
-        public List<BetValue> Values { get; set; } = new();
-    }
-
-    private class BetValue
-    {
-        [JsonPropertyName("value")]
-        public string? Value { get; set; }
-
-        [JsonPropertyName("odd")]
-        public string Odd { get; set; } = string.Empty;
-    }
-
-    private record MatchWinner
-    {
-        public double Home { get; set; }
-        public double Draw { get; set; }
-        public double Away { get; set; }
-    }
-
-    private record UnderOverMarket
-    {
-        public double Under2_5 { get; set; }
-        public double Over2_5 { get; set; }
-    }
-
-    private record BttsMarket
-    {
-        public double Yes { get; set; }
-        public double No { get; set; }
+        public bool HasAny =>
+            Home > 0 || Draw > 0 || Away > 0 || Under2_5 > 0 || Over2_5 > 0 || BttsYes > 0 || BttsNo > 0;
     }
 }
